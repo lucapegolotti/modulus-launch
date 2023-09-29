@@ -28,6 +28,7 @@ import hydra
 from omegaconf import DictConfig
 import json
 import time
+import vtk
 
 
 def denormalize(tensor, mean, stdv):
@@ -181,6 +182,7 @@ class MGNRollout:
             invar[inmask, 1] = graph.ndata["nfeatures"][inmask, 1, i + 1]
             # flow rate must be constant in branches
             self.compute_average_branches(graph, invar[:, 1])
+            invar[inmask, 1] = graph.ndata["nfeatures"][inmask, 1, i + 1]
 
             self.pred[:, :, i + 1] = invar[:, 0:2]
 
@@ -235,46 +237,101 @@ class MGNRollout:
         self.logger.info(f"Relative error in pressure: {errs[0] * 100}%")
         self.logger.info(f"Relative error in flowrate: {errs[1] * 100}%")
 
-    def plot(self, idx):
+    def write_vtk_file(self, graph_name, outfile, outdir=".", vtkcombo=False):
         """
-        Creates plot of pressure and flow rate at the node specified with the
-        idx parameter.
+        Write vtk files (one per timestep) given a graph and a solution.
+        The file can be opened in Paraview.
 
         Arguments:
-            idx: Index of the node to plot pressure and flow rate at.
+            graph: A DGL graph.
+            solution: Tuple containing two n x m tensors, where n is the number of
+                    nodes and m the number of timesteps. The first tensor contains
+                    the pressure solution, the second contains
+                    the flow rate solution
+            outfile (string): name of output file. It can be take value "solution" for
+                              the gnn approximation, or "reference" for the ground
+                              truth.
+            outdir (string): directory where results should be stored
 
         """
-        load = self.graph.ndata["nfeatures"][0, -1, :]
-        p_pred_values = []
-        q_pred_values = []
-        p_exact_values = []
-        q_exact_values = []
 
-        bm = self.graph.ndata["branch_mask"].bool()
+        def write(polydata, filename):
+            writer = vtk.vtkXMLPolyDataWriter()
+            writer.SetFileName(os.path.join(outdir, filename))
+            writer.SetInputData(polydata)
+            writer.Write()
 
-        nsol = self.pred.shape[2]
-        for isol in range(nsol):
-            if load[isol] == 0:
-                p_pred_values.append(self.pred[bm, 0, isol][idx].cpu())
-                q_pred_values.append(self.pred[bm, 1, isol][idx].cpu())
-                p_exact_values.append(self.exact[bm, 0, isol][idx].cpu())
-                q_exact_values.append(self.exact[bm, 1, isol][idx].cpu())
+        graph = self.graphs[graph_name]
+        ntimesteps = self.pred.shape[2]
 
-        plt.figure()
-        ax = plt.axes()
+        if outdir != "." and not os.path.exists(outdir):
+            os.makedirs(outdir)
 
-        ax.plot(p_pred_values, label="pred")
-        ax.plot(p_exact_values, label="exact")
-        ax.legend()
-        plt.savefig("pressure.png", bbox_inches="tight")
+        points = graph.ndata["x"].detach().numpy()
+        edges0 = graph.edges()[0].detach().numpy()
+        edges1 = graph.edges()[1].detach().numpy()
 
-        plt.figure()
-        ax = plt.axes()
+        if vtkcombo:
+            polydata = vtk.vtkPolyData()
+            dt = float(graph.ndata["dt"][0, 0])
 
-        ax.plot(q_pred_values, label="pred")
-        ax.plot(q_exact_values, label="exact")
-        ax.legend()
-        plt.savefig("flowrate.png", bbox_inches="tight")
+        for t in range(ntimesteps):
+            types = np.argmax(graph.edata["type"].detach().numpy(), axis=1)
+            p_edges = np.where(types < 2)[0]
+
+            if not vtkcombo:
+                polydata = vtk.vtkPolyData()
+
+            # Add points
+            point_vtk = vtk.vtkPoints()
+            for point in points:
+                point_vtk.InsertNextPoint(point)
+            polydata.SetPoints(point_vtk)
+
+            # Prepare to add lines (cells)
+            lines = vtk.vtkCellArray()
+            for index in p_edges:
+                pt1 = edges0[index]
+                pt2 = edges1[index]
+                lines.InsertNextCell(2)
+                lines.InsertCellPoint(pt1)
+                lines.InsertCellPoint(pt2)
+            polydata.SetLines(lines)
+
+            # Add Point Data
+            pressure_array = vtk.vtkFloatArray()
+            if vtkcombo:
+                pressure_array.SetName(f"pressure__{t * dt:.3f}")
+            else:
+                pressure_array.SetName("pressure")
+            pressure_array.SetNumberOfComponents(1)
+
+            flowrate_array = vtk.vtkFloatArray()
+            if vtkcombo:
+                flowrate_array.SetName(f"flowrate_{t * dt:.3f}")
+            else:
+                flowrate_array.SetName("flowrate")
+            flowrate_array.SetNumberOfComponents(1)
+
+            if outfile == "solution":
+                for i in range(len(points)):
+                    pressure_array.InsertNextValue(self.pred[i, 0, t].item())
+                    flowrate_array.InsertNextValue(self.pred[i, 1, t].item())
+            elif outfile == "reference":
+                for i in range(len(points)):
+                    pressure_array.InsertNextValue(self.exact[i, 0, t].item())
+                    flowrate_array.InsertNextValue(self.exact[i, 1, t].item())
+            else:
+                raise ValueError("Solution type " + outfile + " is unknown.")
+
+            polydata.GetPointData().AddArray(pressure_array)
+            polydata.GetPointData().AddArray(flowrate_array)
+
+            if not vtkcombo:
+                write(polydata, f"{outfile}_{t:04d}.vtp")
+
+        if vtkcombo:
+            write(polydata, f"{outfile}.vtp")
 
 
 @hydra.main(version_base=None, config_path=".", config_name="config")
@@ -294,7 +351,12 @@ def do_rollout(cfg: DictConfig):
     rollout.denormalize()
     rollout.compute_errors()
     # change idx to plot pressure and flowrate at a different point
-    rollout.plot(idx=5)
+    rollout.write_vtk_file(
+        cfg.testing.graph, "solution", "simulation_results/", vtkcombo=True
+    )
+    rollout.write_vtk_file(
+        cfg.testing.graph, "reference", "simulation_results/", vtkcombo=True
+    )
 
 
 """

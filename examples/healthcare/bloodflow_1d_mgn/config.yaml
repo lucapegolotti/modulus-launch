@@ -37,7 +37,7 @@ performance:
   jit: False
 
 testing:
-  graph: "s0090_0001.21.0.grph"
+  graph: "s0095_0001.21.0.grph"
 
 architecture:
   processor_size: 5
